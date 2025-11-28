@@ -64,6 +64,8 @@ jobs:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     needs: [test, security]
+    outputs:
+      new_version: ${{ steps.version_update.outputs.new_version }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,22 +78,117 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
 
-      # ПРОСТАЯ ВЕРСИЯ - БЕЗ ОБНОВЛЕНИЯ ВЕРСИИ (для теста)
-      - name: Show current files
+      # ОБНОВЛЕНИЕ ВЕРСИИ
+      - name: Update version
+        id: version_update
         run: |
-          echo "📁 Current files:"
-          ls -la
-          echo "📄 Version file content:"
-          cat version
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          OLD_VERSION=$(cat version)
+          
+          IFS='.' read -r -a version_parts <<< "$OLD_VERSION"
+          major=${version_parts[0]}
+          minor=${version_parts[1]}
+          patch=${version_parts[2]}
 
-      - name: Simple Docker build test
+          if [[ $BRANCH_NAME == feature/* ]]; then
+            ((minor++))
+            patch=0
+            UPDATE_TYPE="minor"
+          else
+            ((patch++))
+            UPDATE_TYPE="patch"
+          fi
+
+          NEW_VERSION="$major.$minor.$patch"
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo $NEW_VERSION > version
+
+          git add version
+          git commit -m "[$NEW_VERSION] < [$OLD_VERSION] $UPDATE_TYPE up"
+          git push
+
+      - name: Add version label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const newVersion = '${{ steps.version_update.outputs.new_version }}';
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: [newVersion]
+            })
+
+      # ОБНОВЛЕНИЕ CHANGELOG
+      - name: Update CHANGELOG
         run: |
-          echo "🐳 Testing Docker build..."
-          docker build -t test-image .
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          NEW_VERSION="${{ steps.version_update.outputs.new_version }}"
+          DATE=$(date +'%Y-%m-%d')
+          ENTRY="## [$NEW_VERSION] - $DATE\n### Added\n- Merged $BRANCH_NAME branch\n"
+          
+          echo -e "$ENTRY\n$(cat CHANGELOG.md)" > CHANGELOG.md
 
-      - name: Success message
-        run: echo "🎉 Pipeline completed successfully!"
+          git add CHANGELOG.md
+          git commit -m "Update CHANGELOG for version $NEW_VERSION"
+          git push
 
+      - name: Add changelog label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['changelog']
+            })
+
+      # СБОРКА DOCKER ОБРАЗА
+      - name: Build and push Docker image
+        run: |
+          NEW_VERSION="${{ steps.version_update.outputs.new_version }}"
+          echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/pipeline:$NEW_VERSION .
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/pipeline:$NEW_VERSION
+
+      - name: Add dockerhub label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['dockerhub']
+            })
+
+      # TELEGRAM УВЕДОМЛЕНИЯ
+      - name: Send Telegram notification
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🚀 New Release Published!
+            📦 Repository: https://github.com/${{ github.repository }}
+            🏷 Version: ${{ steps.version_update.outputs.new_version }}
+            🔗 Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version_update.outputs.new_version }}
+            🐳 Docker: https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/pipeline
+          files: CHANGELOG.md
+
+      # GITHUB RELEASE
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version_update.outputs.new_version }}
+          name: Release ${{ steps.version_update.outputs.new_version }}
+          body: |
+            Automated release for version ${{ steps.version_update.outputs.new_version }}
+            Changes included from ${{ github.event.pull_request.head.ref }} branch.
+          files: CHANGELOG.md
+
+      # PROD ЛЕЙБЛ
       - name: Add PROD label
         uses: actions/github-script@v7
         with:
